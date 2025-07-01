@@ -1,267 +1,289 @@
 import os
 import json
 import re
-import torch
-import numpy as np
-from tqdm import tqdm
-from typing import Dict, List, Any, Callable, Optional
 import time
 import argparse
-import warnings
 from pathlib import Path
+from typing import Dict, List
 
 # --- Dependency Imports ---
-# NOTE: vLLM and OpenAI are no longer needed
-import dashscope # New dependency
-from dashscope.api_v1.protocol import Role # For structured conversation
-from transformers import AutoTokenizer, AutoProcessor # Still needed for retriever
-from video_utils import (_get_video_duration, _cut_video_clips, extract_subtitles, timestamp_to_clip_path,
-                         is_valid_video, is_valid_frame, extract_video_clip, parse_subtitle_time, clip_number_to_clip_path)
-                         # image_paths_to_base64 is no longer needed for VLM calls
-from retriever import Retrieval_Manager
-from prompt import *
-from moviepy.video.io.VideoFileClip import VideoFileClip
-from concurrent.futures import ThreadPoolExecutor
+# Make sure to install these libraries: pip install dashscope "ffmpeg-python" Pillow
+import ffmpeg
+import dashscope
+from http import HTTPStatus
+from dashscope.api_entities.dashscope_response import Role
 
-# --- Environment Configuration ---
-os.environ["TOKENIZERS_PARALLELISM"] = "true"
+# --- Environment and Constants ---
+MAX_AGENT_ROUNDS = 5
 
-MAX_DS_ROUND = 20
+# ==============================================================================
+# --- SELF-CONTAINED VIDEO PREPROCESSING HELPERS ---
+# ==============================================================================
+
+def _get_video_duration(video_path: str) -> float:
+    """Gets the duration of a video in seconds using ffmpeg-python."""
+    try:
+        probe = ffmpeg.probe(video_path)
+        video_info = next(s for s in probe['streams'] if s['codec_type'] == 'video')
+        return float(video_info['duration'])
+    except (ffmpeg.Error, StopIteration, KeyError) as e:
+        print(f"⚠️  Warning: Could not get video duration for {video_path}. Defaulting to 0. Error: {e}")
+        return 0.0
+
+def _cut_video_clips_fast(video_path: str, clips_dir: str, video_name: str, clip_duration: int):
+    """Cuts a video into smaller clips using a fast ffmpeg stream copy."""
+    if not os.path.exists(clips_dir):
+        os.makedirs(clips_dir)
+    try:
+        (
+            ffmpeg
+            .input(video_path)
+            .output(os.path.join(clips_dir, f'{video_name}_%04d.mp4'),
+                    f='segment',
+                    segment_time=clip_duration,
+                    c='copy',
+                    reset_timestamps=1)
+            .run(capture_stdout=True, capture_stderr=True, overwrite_output=True)
+        )
+    except ffmpeg.Error as e:
+        print("❌ FFmpeg Error during video cutting:")
+        print(e.stderr.decode())
+        raise
+
+def _extract_frames_from_clips(clips_directory: str, fps: int = 1):
+    """Extracts frames from all .mp4 files in a directory."""
+    print(f"Searching for video clips in: {clips_directory}")
+    for filename in os.listdir(clips_directory):
+        if filename.lower().endswith('.mp4'):
+            input_path = os.path.join(clips_directory, filename)
+            output_pattern = os.path.join(clips_directory, f"{os.path.splitext(filename)[0]}_frame_%04d.jpg")
+            
+            try:
+                (
+                    ffmpeg
+                    .input(input_path)
+                    .filter('fps', fps=fps)
+                    .output(output_pattern, start_number=0)
+                    .run(capture_stdout=True, capture_stderr=True, overwrite_output=True)
+                )
+            except ffmpeg.Error as e:
+                print(f"  ⚠️ Warning: Could not extract frames from {filename}. Error: {e.stderr.decode()}")
+
 
 class VideoQAManager:
-    """A QA manager that uses the Dashscope API for all model inference."""
+    """An API-powered QA manager that automates and optimizes video preprocessing."""
 
-    def __init__(self, args, step_callback: Optional[Callable] = None):
+    def __init__(self, args):
         self.args = args
         self.clip_duration = args.clip_duration
+        self.fps = args.fps
+        self.clips_dir = None
         
-        # Determine if subtitles should be used and add the attribute to the args object
-        self.use_subtitle = bool(args.subtitle_path)
-        self.args.use_subtitle = self.use_subtitle
+        # Set the international API endpoint
+        dashscope.base_http_api_url = "https://dashscope-intl.aliyuncs.com/api/v1/"
         
-        self.clip_fps = args.clip_fps
-        self.step_callback = step_callback or self._default_step_callback
-
-        # Store Dashscope model names
+        # API Configuration
         self.llm_model_name = args.llm_model_name
-        self.vlm_model_name = args.vlm_model_name
+        self.vl_model_name = args.vl_model_name
+        
+        if not os.getenv('DASHSCOPE_API_KEY'):
+            raise ValueError("DASHSCOPE_API_KEY environment variable not set. Please export your API key.")
+        
+        print(f"✅ Dashscope API key found. Using LLM: '{self.llm_model_name}' and VLM: '{self.vl_model_name}'")
 
-        self._initialize_components()
-
-        self.messages = []
-        self.cur_turn = 0
-
-    def _default_step_callback(self, step_data):
-        # This can be used for logging if needed
-        pass
-
-    def _initialize_components(self):
-        """Initializes components and validates the Dashscope API key."""
-        try:
-            # 1. Validate Dashscope API Key
-            dashscope.api_key = os.getenv("DASHSCOPE_API_KEY")
-            if not dashscope.api_key:
-                raise ValueError("The 'DASHSCOPE_API_KEY' environment variable is not set.")
-            print("✅ [SUCCESS] Dashscope API key found.")
-
-            # 2. Initialize retriever (still local)
-            self.clip_save_folder = f'{self.args.dataset_folder}/clips/{self.args.clip_duration}/'
-            self.args.retriever_type = 'large'
-            self.retriever = Retrieval_Manager(args=self.args, clip_save_folder=self.clip_save_folder)
-            self.retriever.load_model_to_gpu(0)
-            print("✅ [SUCCESS] Retrieval Manager initialized")
-
-        except Exception as e:
-            print(f"❌ [ERROR] Failed to initialize components: {e}")
-            raise
-
-    def single_text2text_with_callback(self, message: List[Dict]):
-        """Performs a text-to-text call using the Dashscope Generation API."""
-        print(f"🤔 Calling Dashscope Text LLM ({self.llm_model_name})...")
-        for retry in range(3):
-            try:
-                response = dashscope.Generation.call(
-                    model=self.llm_model_name,
-                    messages=message,
-                    result_format='message'
-                )
-                if response.status_code == 200:
-                    return response.output.choices[0].message.content.strip()
-                else:
-                    print(f"   [WARNING] API call failed (attempt {retry+1}/3): {response.code} - {response.message}")
-            except Exception as e:
-                print(f"   [WARNING] Exception during API call (attempt {retry+1}/3): {e}")
-            if retry < 2:
-                time.sleep(5)
-        return "" # Return empty if all retries fail
-
-    def _single_vlm_call(self, query: str, frame_paths: List[str]) -> str:
-        """Helper function for a single VLM API call."""
-        # Construct the content list with local file paths
-        content = []
-        for p in frame_paths:
-            if os.path.exists(p):
-                # Dashscope can directly handle local file paths
-                content.append({'image': f'file://{os.path.abspath(p)}'})
-        content.append({'text': query})
-
-        if len(content) == 1: # No valid images found
-            return "Error: No valid images provided for VLM analysis."
-
+    def call_qwen_vl_max(self, query: str, image_paths: List[str]) -> str:
+        """Calls qwen-vl-max with a query and local image paths."""
+        print(f"   VLM CALL: Analyzing {len(image_paths)} images with query: '{query[:50]}...'")
+        local_file_urls = [f'file://{os.path.abspath(p)}' for p in image_paths]
+        messages = [{'role': 'user', 'content': [{'text': query}, *[{"image": url} for url in local_file_urls]]}]
+        
         try:
             response = dashscope.MultiModalConversation.call(
-                model=self.vlm_model_name,
-                messages=[{'role': Role.USER, 'content': content}]
+                model=self.vl_model_name,
+                messages=messages,
+                api_key=os.getenv('DASHSCOPE_API_KEY')
             )
-            if response.status_code == 200:
-                return response.output.choices[0].message.content.strip()
+            if response.status_code == HTTPStatus.OK:
+                return response.output.choices[0].message.content
             else:
-                return f"Error from API: {response.code} - {response.message}"
+                return f"Error: VLM API call failed with code {response.code} - {response.message}"
         except Exception as e:
-            return f"Exception during VLM API call: {e}"
+            return f"Error: An exception occurred during the VLM API call: {e}"
 
-    def batch_video2text_server(self, queries: List[str], video_paths: List[List[str]]) -> List[str]:
-        """Handles batch VLM calls using a thread pool for concurrency."""
-        print(f"🧠 Calling Dashscope VLM ({self.vlm_model_name}) for {len(queries)} items concurrently...")
-        results = [None] * len(queries)
-        with ThreadPoolExecutor(max_workers=10) as executor: # Adjust max_workers as needed
-            future_to_index = {
-                executor.submit(self._single_vlm_call, query, frames): i
-                for i, (query, frames) in enumerate(zip(queries, video_paths))
-            }
-            for future in tqdm(future_to_index, desc="Processing VLM calls"):
-                index = future_to_index[future]
-                try:
-                    results[index] = future.result()
-                except Exception as e:
-                    results[index] = f"Failed to process query: {e}"
-        print("✅ VLM processing complete.")
-        return results
-
-    # The following methods can remain largely the same, as they call the abstracted functions above.
-    def preprocess_video(self, video_path):
-        video_name = Path(video_path).stem
-        clips_dir = os.path.join(self.args.dataset_folder, 'clips', str(self.clip_duration), video_name)
-        os.makedirs(clips_dir, exist_ok=True)
+    def call_qwen_max(self, messages: List[Dict]) -> str:
+        """Calls the qwen-plus model, correctly handling the streaming response required by 'enable_thinking'."""
+        print("  LLM CALL: Engaging Deep Thinking (streaming)...")
         try:
-            duration = _get_video_duration(video_path)
-            print(f"📊 Analyzing video... Duration: {duration:.2f}s")
-            print("✂️ Cutting video into clips...")
-            with ThreadPoolExecutor(max_workers=os.cpu_count()) as executor:
-                executor.submit(_cut_video_clips, video_path, clips_dir, video_name, duration).result()
-            print("✅ Video preprocessing completed!")
+            response_stream = dashscope.Generation.call(
+                model=self.llm_model_name,
+                messages=messages,
+                result_format="message",
+                enable_thinking=True,
+                stream=True,
+                incremental_output=True,
+                api_key=os.getenv('DASHSCOPE_API_KEY')
+            )
+            reasoning_content = ""
+            full_content = ""
+            for chunk in response_stream:
+                if chunk.status_code == HTTPStatus.OK:
+                    message = chunk.output.choices[0].message
+                    if hasattr(message, 'reasoning_content') and message.reasoning_content is not None:
+                        reasoning_content += message.reasoning_content
+                    if message.content is not None:
+                        full_content += message.content
+                else:
+                    return f"Error during stream: {chunk.code} - {chunk.message}"
+            
+            if reasoning_content:
+                print("\n" + "=" * 20 + " Thinking Process " + "=" * 20)
+                print(reasoning_content.strip())
+                print("=" * 58)
+
+            return full_content
         except Exception as e:
-            print(f"❌ [ERROR] Video preprocessing failed: {e}")
+            return f"Error: An exception occurred during the LLM API call: {e}"
+
+    def preprocess_video(self, video_path: str):
+        """INTEGRATED WORKFLOW: Cuts video and extracts frames, skipping steps if output already exists."""
+        video_name = Path(video_path).stem
+        self.clips_dir = os.path.join(self.args.dataset_folder, 'clips', str(self.clip_duration), video_name)
+        
+        print("\n--- Starting Video Preprocessing ---")
+        try:
+            clips_exist = os.path.isdir(self.clips_dir) and any(f.lower().endswith('.mp4') for f in os.listdir(self.clips_dir))
+            if not clips_exist:
+                print("Step 1/2: Clips not found. Cutting video into clips...")
+                _cut_video_clips_fast(video_path, self.clips_dir, video_name, self.clip_duration)
+            else:
+                print("Step 1/2: Video clips already exist. Skipping cutting step.")
+
+            frames_exist = os.path.isdir(self.clips_dir) and any(f.lower().endswith(('.jpg', '.jpeg', '.png')) for f in os.listdir(self.clips_dir))
+            if not frames_exist:
+                print("Step 2/2: Frames not found. Extracting frames from clips...")
+                _extract_frames_from_clips(self.clips_dir, fps=self.fps)
+            else:
+                print("Step 2/2: Image frames already exist. Skipping extraction step.")
+            print("--- Video Preprocessing Complete ---\n")
+        except Exception as e:
+            print(f"❌ [FATAL ERROR] Video preprocessing failed: {e}")
             raise
 
-    def process_tools_with_callback(self, output_text, video_path, duration):
-        # This function's logic doesn't need to change as it calls the newly implemented
-        # batch_video2text_server, which now uses the Dashscope API.
-        tool_result = ''
-        output_text_clean = output_text.split('</thinking>')[1] if '</thinking>' in output_text else output_text
-        if "<video_reader_question>" in output_text:
-            # Placeholder for tool logic, assuming it correctly prepares `queries` and `video_clips_list`
-            # For brevity, this part is simplified.
-            pattern = r"<video_reader>([^<]+)</video_reader>\s*<video_reader_question>([^<]+)</video_reader_question>"
-            matches = re.findall(pattern, output_text_clean)
-            if matches:
-                queries, video_clips_list = [], [] # You need your logic here to populate these
-                # Your logic to convert match_set (e.g., '1;2;3') into a list of frame file paths
-                # and to populate `queries` and `video_clips_list`
-                # Example placeholder:
-                for match_set, query in matches:
-                    queries.append(query)
-                    # This is where you would call timestamp_to_clip_path or similar
-                    # to get the list of frame paths for each query
-                    video_clips_list.append([]) # Replace with actual frame paths
-                
-                ans_li = self.batch_video2text_server(queries, video_clips_list)
-                for (match_set, _), ans in zip(matches, ans_li):
-                    tool_result += f'Video reader result for {match_set}: {ans}\n'
-        return tool_result
+    def get_frame_paths_for_analysis(self, num_frames: int) -> List[str]:
+        """Samples frames evenly across all extracted frames for API analysis."""
+        if not self.clips_dir or not os.path.isdir(self.clips_dir):
+            return []
+        all_frames = sorted([f for f in os.listdir(self.clips_dir) if f.lower().endswith(('.png', '.jpg', '.jpeg'))])
+        if not all_frames: return []
+        if len(all_frames) <= num_frames:
+            return [os.path.join(self.clips_dir, f) for f in all_frames]
+        indices = [int(i * (len(all_frames) - 1) / (num_frames - 1)) for i in range(num_frames)]
+        return [os.path.join(self.clips_dir, all_frames[i]) for i in indices]
 
-    def run_pipeline(self, question: str, video_path: str, subtitle_path: str, max_rounds: int, enable_debug: bool) -> Dict:
-        self.messages, self.cur_turn = [], 0
-        print("\n" + "="*60 + f"\n🚀 Starting Video QA Pipeline for: {Path(video_path).name}\n" + "="*60 + "\n")
-        try:
-            self.preprocess_video(video_path)
-            with VideoFileClip(video_path) as clip: duration = clip.duration
-        except Exception as e:
-            if enable_debug: raise
-            return {"error": f"Preprocessing failed: {e}"}
+    def run_pipeline(self, question: str, video_path: str) -> Dict:
+        """The main orchestration loop using an agentic approach."""
+        self.preprocess_video(video_path)
+        duration = _get_video_duration(video_path)
+        num_frames_available = len(self.get_frame_paths_for_analysis(99999))
+
+        if num_frames_available == 0:
+            return {"error": "No frames were extracted from the video. Cannot proceed."}
+
+        initial_user_prompt = f"""I have a video that is {duration:.0f} seconds long. I have already processed it and extracted {num_frames_available} frames for you to analyze.
+
+My question is: "{question}"
+
+Please begin your analysis by deciding what to look for first."""
+
+        system_prompt = f"""You are an expert video analysis assistant. Your goal is to answer the user's question about a video.
+You have access to a tool called `video_analyzer`. This tool can look at frames from the video and answer specific questions about what is happening visually.
+To use the tool, you MUST respond with ONLY a JSON object in the following format:
+{{"tool": "video_analyzer", "query": "Your specific question for the vision model. Be very specific."}}
+
+**Your process:**
+1.  Analyze the user's initial question and the provided context about the video.
+2.  If you need visual information, formulate a precise question for the `video_analyzer` tool and respond with the required JSON. Do not add any other text.
+3.  After you receive the information from the tool, analyze it.
+4.  If you have enough information, provide the final answer inside <answer> tags.
+5.  If you need more visual information, call the `video_analyzer` tool again.
+"""
+        messages = [
+            {"role": Role.SYSTEM, "content": system_prompt},
+            {"role": Role.USER, "content": initial_user_prompt}
+        ]
         
-        initial_prompt = self.build_initial_prompt(question, duration, None)
-        self.messages = [{"role": Role.USER, "content": initial_prompt}]
+        for i in range(self.args.max_rounds):
+            print(f"\n🔄 --- Agent Round {i + 1}/{self.args.max_rounds} --- 🔄\n")
+            
+            planner_response_content = self.call_qwen_max(messages)
+            messages.append({"role": Role.ASSISTANT, "content": planner_response_content})
+            print(f"🧠 Planner's Response:\n{planner_response_content}")
+
+            if '<answer>' in planner_response_content:
+                final_answer = re.search(r'<answer>(.*?)</answer>', planner_response_content, re.DOTALL)
+                if final_answer:
+                    print("\n" + "="*50 + f"\n🎯 Final Answer Found!\n" + "="*50)
+                    return {"question": question, "answer": final_answer.group(1).strip(), "conversation": messages}
+            
+            try:
+                json_match = re.search(r'\{.*\}', planner_response_content, re.DOTALL)
+                if not json_match:
+                    messages.append({"role": Role.USER, "content": "That was not a valid tool call. Please try again or provide a final answer."})
+                    continue
+                    
+                tool_call = json.loads(json_match.group(0))
+                if tool_call.get("tool") == "video_analyzer":
+                    vlm_query = tool_call.get("query", "Describe what you see.")
+                    frame_paths = self.get_frame_paths_for_analysis(num_frames=8)
+                    
+                    if not frame_paths:
+                        observation = "Error: No frames were found to analyze."
+                    else:
+                        observation = self.call_qwen_vl_max(vlm_query, frame_paths)
+                    
+                    print(f"📊 Observation from VLM:\n{observation}")
+                    
+                    # --- FINAL FIX IS HERE ---
+                    # Feed the observation back as a user message, not a tool message.
+                    user_observation_prompt = f"Observation from video_analyzer: {observation}"
+                    messages.append({"role": Role.USER, "content": user_observation_prompt})
+                    # --- END OF FIX ---
+
+            except (json.JSONDecodeError, TypeError):
+                print("   (No valid tool call detected in response)")
+                messages.append({"role": Role.USER, "content": "Your response was not a valid JSON tool call. Please try again or provide a final answer."})
+                pass
         
-        while self.cur_turn < max_rounds:
-            print(f"\n🔄 --- Round {self.cur_turn + 1}/{max_rounds} --- 🔄\n")
-            response = self.single_text2text_with_callback(self.messages)
-            if not response: print("❌ Failed to get model response. Aborting."); break
-            
-            self.messages.append({"role": Role.ASSISTANT, "content": response})
-            print("🧠 Assistant's Reasoning & Actions:\n" + response)
-            
-            if '<answer>' in response:
-                final_answer = self.extract_final_answer(response)
-                print("\n" + "="*50 + f"\n🎯 Final Answer Found: {final_answer}\n" + "="*50)
-                return {"question": question, "answer": final_answer, "conversation": self.messages}
-            
-            tool_result = self.process_tools_with_callback(response, video_path, duration)
-            if tool_result:
-                self.messages.append({"role": Role.USER, "content": tool_result})
-            else: # If no tools are called, loop again with a nudge
-                self.messages.append({"role": Role.USER, "content": "Please continue. Use a tool if you need more information or provide the final answer."})
-            
-            self.cur_turn += 1
-        return {"question": question, "answer": "Max rounds reached", "conversation": self.messages}
-
-    def build_initial_prompt(self, question, duration, subtitles):
-        return f"The video is {duration:.0f} seconds long. The user's question is: {question}. Analyze the video using the available tools and provide a concise answer inside <answer></answer> tags."
-
-    def extract_final_answer(self, text: str) -> str:
-        match = re.search(r'<answer>(.*?)</answer>', text, re.DOTALL)
-        return match.group(1).strip() if match else "Could not extract answer from model response."
+        return {"question": question, "answer": "Max rounds reached without a final answer.", "conversation": messages}
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Video QA CLI using Dashscope APIs")
-    
-    # Core arguments
+    parser = argparse.ArgumentParser(description="Fully Automated Video QA with Dashscope APIs")
     parser.add_argument("--video_path", type=str, required=True, help="Path to the video file.")
     parser.add_argument("--question", type=str, required=True, help="Question about the video.")
     
-    # Dashscope model arguments
-    parser.add_argument("--vlm_model_name", type=str, default="qwen-vl-plus", help="Dashscope VLM model ID.")
-    parser.add_argument("--llm_model_name", type=str, default="qwen-long", help="Dashscope text LLM model ID.")
+    # API Model Arguments
+    parser.add_argument("--llm_model_name", type=str, default="qwen-plus", help="Dashscope model for reasoning (e.g., qwen-plus, qwen-max).")
+    parser.add_argument("--vl_model_name", type=str, default="qwen-vl-plus", help="Dashscope model for vision analysis.")
     
-    # Configuration
-    parser.add_argument("--dataset_folder", type=str, default='./data', help="Folder for clips and data.")
-    parser.add_argument("--clip_duration", type=int, default=10, help="Duration of video clips (seconds).")
-    parser.add_argument("--clip_fps", type=float, default=1.0, help="FPS for frame sampling.")
-    parser.add_argument("--max_rounds", type=int, default=10, help="Max conversation rounds.")
+    # Preprocessing Arguments
+    parser.add_argument("--dataset_folder", type=str, default='./data', help="Folder to store preprocessed clips and frames.")
+    parser.add_argument("--clip_duration", type=int, default=10, help="Duration of video clips in seconds.")
+    parser.add_argument("--fps", type=int, default=1, help="Frames per second to extract from clips.")
     
-    # I/O
-    parser.add_argument("--subtitle_path", type=str, default=None, help="Optional path to subtitle file.")
-    parser.add_tument("--auto_save", action='store_true', help="Save final results to JSON.")
-    parser.add_argument("--enable_debug", action='store_true', help="Enable debug mode for verbose errors.")
+    # Agent Arguments
+    parser.add_argument("--max_rounds", type=int, default=MAX_AGENT_ROUNDS, help="Max conversation rounds for the agent.")
     
     args = parser.parse_args()
 
     try:
         manager = VideoQAManager(args)
-        result = manager.run_pipeline(
-            question=args.question, video_path=args.video_path, subtitle_path=args.subtitle_path,
-            max_rounds=args.max_rounds, enable_debug=args.enable_debug
-        )
+        result = manager.run_pipeline(question=args.question, video_path=args.video_path)
+        
         print("\n--- FINAL RESULT ---")
         print(json.dumps(result, indent=2, ensure_ascii=False))
-        if args.auto_save and result:
-            filename = f"video_qa_result_{Path(args.video_path).stem}_{int(time.time())}.json"
-            with open(filename, 'w', encoding='utf-8') as f:
-                json.dump(result, f, indent=2, ensure_ascii=False)
-            print(f"\n📁 Results saved to {filename}")
+        
     except Exception as e:
         print(f"\n❌ An unexpected error occurred: {e}")
-        if args.enable_debug:
-            import traceback
-            traceback.print_exc()
+        import traceback
+        traceback.print_exc()
